@@ -210,11 +210,58 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
+/**
+ * Build a stale-ID error that gives the sender a recovery path instead of
+ * a dead-end "not found". Peer IDs rotate every session, so cached IDs
+ * (from old list_peers output, claims files, or restart notes) go stale
+ * constantly — the error lists the currently-live peers so the caller can
+ * retarget without a second round-trip.
+ */
+function staleSendError(toId: string, note: string): string {
+  const live = (selectAllPeers.all() as Peer[])
+    .filter((p) => {
+      try {
+        process.kill(p.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .map((p) => {
+      const summary = p.summary ? ` — ${p.summary.slice(0, 60)}` : "";
+      return `${p.id} (${p.cwd}${summary})`;
+    });
+  const hint =
+    toId === "all" || toId === "*" || toId === "broadcast"
+      ? 'Broadcast is not supported — send to each peer ID individually.'
+      : "Peer IDs rotate every session; re-run list_peers and use a fresh ID.";
+  const liveList = live.length > 0 ? live.join("; ") : "(none)";
+  return `Peer ${toId} not found${note}. ${hint} Live peers: ${liveList}`;
+}
+
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  if (!body.to_id || body.to_id === "undefined" || body.to_id === "null") {
+    return { ok: false, error: staleSendError(String(body.to_id), " (missing/invalid to_id)") };
+  }
+
+  // Verify target exists AND its process is still alive. A row whose PID is
+  // dead is a zombie registration — accepting the message would be a silent
+  // drop (it sits undelivered forever). Clean it up and tell the sender.
+  const target = db.query("SELECT id, pid FROM peers WHERE id = ?").get(body.to_id) as
+    | { id: string; pid: number }
+    | null;
   if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+    return { ok: false, error: staleSendError(body.to_id, "") };
+  }
+  try {
+    process.kill(target.pid, 0);
+  } catch {
+    deletePeer.run(target.id);
+    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [target.id]);
+    return {
+      ok: false,
+      error: staleSendError(body.to_id, " (its process is dead; stale registration removed)"),
+    };
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());

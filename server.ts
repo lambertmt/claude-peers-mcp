@@ -310,8 +310,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           text: message,
         });
         if (!result.ok) {
+          let text = `Failed to send: ${result.error}`;
+          // Pre-hint brokers return a bare "Peer X not found" with no
+          // recovery path — enrich client-side so the caller can retarget
+          // without guessing. (New brokers embed "Live peers:" already.)
+          if (
+            result.error?.includes("not found") &&
+            !result.error.includes("Live peers:")
+          ) {
+            try {
+              const peers = await brokerFetch<Peer[]>("/list-peers", {
+                scope: "machine",
+                cwd: myCwd,
+                git_root: myGitRoot,
+                exclude_id: myId,
+              });
+              const live =
+                peers
+                  .map(
+                    (p) =>
+                      `${p.id} (${p.cwd}${p.summary ? " — " + p.summary.slice(0, 60) : ""})`
+                  )
+                  .join("; ") || "(none)";
+              text += `\nPeer IDs rotate every session — re-run list_peers and use a fresh ID. Live peers: ${live}`;
+            } catch {
+              text += `\nPeer IDs rotate every session — re-run list_peers and use a fresh ID.`;
+            }
+          }
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+            content: [{ type: "text" as const, text }],
             isError: true,
           };
         }
@@ -548,6 +575,27 @@ async function main() {
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+
+  // Parent-death watchdog: exit if our parent CC process is gone.
+  // Without this, when the parent CC dies via SIGKILL or sudden host
+  // crash, this bun process is reparented to PID 1 and runs forever,
+  // accumulating zombie peers in the broker. Two complementary signals:
+  //   (a) stdin EOF — parent closed the pipe cleanly
+  //   (b) ppid==1 polling — parent died abruptly and we got reparented
+  const parentDeath = (reason: string) => {
+    log(`Parent death detected (${reason}); exiting`);
+    void cleanup();
+  };
+  process.stdin.on("end", () => parentDeath("stdin EOF"));
+  process.stdin.on("close", () => parentDeath("stdin closed"));
+  const initialPpid = process.ppid;
+  const parentCheckTimer = setInterval(() => {
+    const currentPpid = process.ppid;
+    if (currentPpid === 1 && initialPpid !== 1) {
+      clearInterval(parentCheckTimer);
+      parentDeath("reparented to init");
+    }
+  }, 5000);
 }
 
 main().catch((e) => {
